@@ -4,6 +4,7 @@ export const STORAGE_KEYS = {
   source: 'srtfix.source.v1',
   selection: 'srtfix.selection.v1',
   settings: 'srtfix.settings.v1',
+  locks: 'srtfix.locks.v1',
 } as const
 
 export function saveJSON(key: string, value: unknown): void {

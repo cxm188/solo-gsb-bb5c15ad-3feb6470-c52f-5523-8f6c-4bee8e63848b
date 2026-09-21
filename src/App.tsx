@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useState } from 'react'
 import CompareView from './components/CompareView'
 import { formatSrt, msToSrtTime, parseSrt, SrtCue } from './lib/srt'
-import { solve, SolveResult, MAX_SELECTION, Settings } from './lib/solver'
+import { solve, SolveResult, MAX_SELECTION, Settings, CueLock } from './lib/solver'
 import { loadJSON, saveJSON, STORAGE_KEYS, clearAll } from './lib/storage'
 import { SAMPLE_SRT } from './lib/sample'
 
@@ -16,6 +16,10 @@ export default function App() {
     ...DEFAULT_SETTINGS,
     ...(loadJSON<Partial<Settings>>(STORAGE_KEYS.settings) ?? {}),
   }))
+  // 锚点锁定：按全局字幕序号存储；修改选区/参数后保留，重新导入字幕时清空
+  const [locks, setLocks] = useState<Record<number, CueLock>>(
+    () => loadJSON<Record<number, CueLock>>(STORAGE_KEYS.locks) ?? {}
+  )
   const [result, setResult] = useState<SolveResult | null>(null)
   const [parseWarnings, setParseWarnings] = useState<string[]>([])
   const [confirmed, setConfirmed] = useState(false)
@@ -42,12 +46,32 @@ export default function App() {
     setConfirmed(false)
   }, [])
 
+  const persistLocks = useCallback((next: Record<number, CueLock>) => {
+    setLocks(next)
+    saveJSON(STORAGE_KEYS.locks, next)
+    setResult(null)
+    setConfirmed(false)
+  }, [])
+
+  const toggleLock = useCallback(
+    (idx: number, kind: keyof CueLock) => {
+      const cur = locks[idx] ?? {}
+      const updated: CueLock = { ...cur, [kind]: !cur[kind] }
+      const next = { ...locks }
+      if (!updated.text && !updated.start && !updated.end) delete next[idx]
+      else next[idx] = updated
+      persistLocks(next)
+    },
+    [locks, persistLocks]
+  )
+
   const onFile = async (file: File) => {
     const text = await file.text()
     const r = parseSrt(text)
     setParseWarnings(r.warnings)
     persistSource(text)
     persistRange(null)
+    persistLocks({})
     setResult(null)
   }
 
@@ -56,18 +80,51 @@ export default function App() {
     return parsed.cues.slice(range[0], range[1] + 1)
   }, [parsed.cues, range])
 
+  // 选区内各条的锁定（与 selectedCues 下标对齐）
+  const selectionLocks: Array<CueLock | undefined> = useMemo(() => {
+    if (!range) return []
+    return selectedCues.map((_, k) => locks[range[0] + k])
+  }, [selectedCues, locks, range])
+
+  const lockCount = Object.keys(locks).length
+  const selLockCount = selectionLocks.filter((l) => l && (l.text || l.start || l.end)).length
+
   const runSolve = () => {
     if (!range) return
-    const r = solve(selectedCues, settings)
+    const r = solve(selectedCues, settings, selectionLocks)
     setResult(r)
     setConfirmed(false)
   }
 
   const exportSrt = () => {
     if (!result || !result.ok || !range) return
-    // 用修复结果替换选区，其余条保持原样；序号统一重排
+    // 防御性校验：求解结果不得违反任何锁定（求解器已保证，此处兜底中止）
+    for (let k = 0; k < result.cues.length; k++) {
+      const lk = locks[range[0] + k]
+      const orig = parsed.cues[range[0] + k]
+      const c = result.cues[k]
+      if (!lk || !orig) continue
+      if (
+        (lk.start && c.startMs !== orig.startMs) ||
+        (lk.end && c.endMs !== orig.endMs) ||
+        (lk.text && c.text !== orig.lines.map((l) => l.trim()).filter(Boolean).join(' '))
+      ) {
+        alert('求解结果违反了锚点锁定，已中止导出。请重新求解。')
+        return
+      }
+    }
+    // 用修复结果替换选区，其余条保持原样；序号统一重排。
+    // 锁定项严格使用原始值：锁定文字导出原始行，锁定时间导出原始毫秒。
     const all = parsed.cues.map((c) => ({ startMs: c.startMs, endMs: c.endMs, lines: c.lines }))
-    const fixed = result.cues.map((c) => ({ startMs: c.startMs, endMs: c.endMs, lines: c.lines }))
+    const fixed = result.cues.map((c, k) => {
+      const lk = locks[range[0] + k]
+      const orig = parsed.cues[range[0] + k]
+      return {
+        startMs: lk?.start ? orig.startMs : c.startMs,
+        endMs: lk?.end ? orig.endMs : c.endMs,
+        lines: lk?.text ? orig.lines : c.lines,
+      }
+    })
     all.splice(range[0], range[1] - range[0] + 1, ...fixed)
     const blob = new Blob([formatSrt(all)], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -111,8 +168,8 @@ export default function App() {
       <header className="app-header">
         <h1>字幕节奏修复</h1>
         <p className="sub">
-          导入 SRT → 选择至多 {MAX_SELECTION} 条连续字幕 → 设置节奏参数 → 最小化边界移动量求解。
-          文字内容与顺序、片段总起止时间保持不变，所有数据仅保存在本浏览器。
+          导入 SRT → 选择至多 {MAX_SELECTION} 条连续字幕 → 设置节奏参数（可选锚点锁定）→ 最小化边界移动量求解。
+          文字内容与顺序、片段总起止时间及锁定项保持不变，所有数据仅保存在本浏览器。
         </p>
       </header>
 
@@ -130,7 +187,7 @@ export default function App() {
               onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])}
             />
           </label>
-          <button className="ghost" onClick={() => { persistSource(SAMPLE_SRT); persistRange(null); setParseWarnings([]) }}>
+          <button className="ghost" onClick={() => { persistSource(SAMPLE_SRT); persistRange(null); persistLocks({}); setParseWarnings([]) }}>
             载入示例
           </button>
           {parsed.cues.length > 0 && (
@@ -140,6 +197,7 @@ export default function App() {
                 clearAll()
                 setSource('')
                 persistRange(null)
+                persistLocks({})
                 setResult(null)
                 setParseWarnings([])
               }}
@@ -166,24 +224,81 @@ export default function App() {
             选择连续字幕（点击条目扩展/收缩选区，最多 {MAX_SELECTION} 条）
           </h2>
           <div className="cue-picker">
-            {parsed.cues.map((c, i) => (
-              <div
-                key={i}
-                className={`cue-row${range && i >= range[0] && i <= range[1] ? ' selected' : ''}`}
-                onClick={() => toggleCue(i)}
-              >
-                <span className="idx">{i + 1}</span>
-                <span className="t">
-                  {msToSrtTime(c.startMs)} → {msToSrtTime(c.endMs)}
-                </span>
-                <span>{c.lines.join(' ')}</span>
-              </div>
-            ))}
+            {parsed.cues.map((c, i) => {
+              const inRange = !!range && i >= range[0] && i <= range[1]
+              const lk = locks[i]
+              return (
+                <div
+                  key={i}
+                  className={`cue-row${inRange ? ' selected' : ''}`}
+                  onClick={() => toggleCue(i)}
+                >
+                  <span className="idx">{i + 1}</span>
+                  <span className="t">
+                    {msToSrtTime(c.startMs)} → {msToSrtTime(c.endMs)}
+                  </span>
+                  <span>{c.lines.join(' ')}</span>
+                  <span className="lock-cell" onClick={(e) => e.stopPropagation()}>
+                    {inRange ? (
+                      <>
+                        <button
+                          type="button"
+                          className={`lock-btn${lk?.text ? ' on' : ''}`}
+                          title="锁定文字归属：该条文字保持原样，不参与跨条断句调整"
+                          onClick={() => toggleLock(i, 'text')}
+                        >
+                          文
+                        </button>
+                        <button
+                          type="button"
+                          className={`lock-btn${lk?.start ? ' on' : ''}`}
+                          title="锁定开始时间：该条开始时间保持原值"
+                          onClick={() => toggleLock(i, 'start')}
+                        >
+                          始
+                        </button>
+                        <button
+                          type="button"
+                          className={`lock-btn${lk?.end ? ' on' : ''}`}
+                          title="锁定结束时间：该条结束时间保持原值"
+                          onClick={() => toggleLock(i, 'end')}
+                        >
+                          终
+                        </button>
+                      </>
+                    ) : (
+                      lk && (
+                        <span className="lock-tags" title="该条仍有锁定，但不在当前选区内，本次求解不生效">
+                          {lk.text && <span className="lock-tag">文</span>}
+                          {lk.start && <span className="lock-tag">始</span>}
+                          {lk.end && <span className="lock-tag">终</span>}
+                        </span>
+                      )
+                    )}
+                  </span>
+                </div>
+              )
+            })}
           </div>
           {range && (
             <p className="hint" style={{ marginTop: 8 }}>
               已选第 {range[0] + 1} – {range[1] + 1} 条（共 {range[1] - range[0] + 1} 条）；片段起止固定为{' '}
               {msToSrtTime(parsed.cues[range[0]].startMs)} – {msToSrtTime(parsed.cues[range[1]].endMs)}
+              {selLockCount > 0 && `；选区内 ${selLockCount} 条已设锚点锁定`}
+            </p>
+          )}
+          {parsed.cues.length > 0 && (
+            <p className="hint" style={{ marginTop: 4 }}>
+              锚点锁定：选区内每行右侧「文 / 始 / 终」分别锁定该条的文字归属、开始时间、结束时间（再点取消）。
+              锁定项在求解与导出时严格保持原值；修改选区或参数后锁定仍保留（仅选区内的锁定参与求解），重新导入字幕后自动清空。
+              {lockCount > 0 && (
+                <>
+                  {' '}当前共 {lockCount} 条已锁定。
+                  <button className="ghost" style={{ marginLeft: 8, padding: '2px 10px' }} onClick={() => persistLocks({})}>
+                    清除全部锁定
+                  </button>
+                </>
+              )}
             </p>
           )}
         </section>
@@ -251,7 +366,7 @@ export default function App() {
                 </li>
               ))}
             </ul>
-            <p className="hint">按提示放宽对应参数后重新求解即可。</p>
+            <p className="hint">按提示放宽对应参数、解除或调整冲突的锚点锁定后重新求解即可。</p>
           </div>
         </section>
       )}
@@ -282,13 +397,16 @@ export default function App() {
             <span>
               <span className="sw sw-time" /> 蓝色标签：该时间边界移动的毫秒数
             </span>
+            <span>
+              <span className="sw sw-lock" /> 🔒 标记：锚点锁定项（求解与导出均严格保持原值）
+            </span>
           </div>
-          <CompareView origCues={selectedCues} result={result} />
+          <CompareView origCues={selectedCues} result={result} locks={selectionLocks} />
           <div className="row" style={{ marginTop: 14 }}>
             <button onClick={exportSrt}>确认并导出 fixed.srt</button>
             <button className="ghost" onClick={runSolve}>重新求解</button>
             {confirmed && <span className="badge good">已导出</span>}
-            <span className="hint">导出文件包含全部字幕：选区替换为修复结果，选区外保持原样并重排序号。</span>
+            <span className="hint">导出文件包含全部字幕：选区替换为修复结果，选区外保持原样并重排序号；锁定项严格保持原文字与原时间。</span>
           </div>
         </section>
       )}

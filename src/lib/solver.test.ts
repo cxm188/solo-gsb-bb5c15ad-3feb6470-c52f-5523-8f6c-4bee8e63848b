@@ -1,10 +1,10 @@
 // 求解器正确性测试（非生产代码）：
-//  - optimizeTimingImpl 与整数坐标暴力枚举的最优值逐案对照
-//  - solve 与“枚举全部断句 × 每案最优时间”的全局最优对照
-//  - 约束满足性、文字保持、起止钉死
-//  - 无解冲突场景
+//  - optimizeTimingImpl 与整数坐标暴力枚举的最优值逐案对照（含锚点锁定）
+//  - solve 与“枚举全部断句 × 每案最优时间”的全局最优对照（含锚点锁定）
+//  - 约束满足性、文字保持、起止钉死、锁定项严格保持
+//  - 无解冲突场景（含锚点冲突、解除锁定后恢复可解）
 import { parseSrt, SrtCue } from './srt'
-import { solve, Settings, optimizeTimingImpl } from './solver'
+import { solve, Settings, CueLock, optimizeTimingImpl } from './solver'
 import { charsOf, flattenCues, wrapText, isCJK } from './text'
 
 let pass = 0
@@ -21,7 +21,7 @@ function approx(a: number, b: number, eps = 0.01) {
 }
 
 // --- 暴力：给定 cuts，整数时间上的逐点 DP（前缀最小值），求最小移动量 ---
-function bruteTiming(cues: SrtCue[], lengths: number[], s: Settings) {
+function bruteTiming(cues: SrtCue[], lengths: number[], s: Settings, locks?: Array<CueLock | undefined>) {
   const n = cues.length
   const D = lengths.map((l) => Math.ceil((1000 * l) / s.cps))
   const B0 = cues[0].startMs
@@ -31,10 +31,10 @@ function bruteTiming(cues: SrtCue[], lengths: number[], s: Settings) {
   const fixed: (number | null)[] = []
   const orig: number[] = []
   for (let i = 0; i < n; i++) {
-    fixed.push(i === 0 ? B0 : null)
+    fixed.push(i === 0 || locks?.[i]?.start ? cues[i].startMs : null)
     orig.push(cues[i].startMs)
     gaps.push(D[i])
-    fixed.push(i === n - 1 ? Eend : null)
+    fixed.push(i === n - 1 || locks?.[i]?.end ? cues[i].endMs : null)
     orig.push(cues[i].endMs)
     if (i < n - 1) gaps.push(s.gapMs)
   }
@@ -68,15 +68,28 @@ function bruteTiming(cues: SrtCue[], lengths: number[], s: Settings) {
 }
 
 // --- 暴力：枚举所有合法断句 cuts（0=c0<c1<...<cn=N），求每案最优时间 ---
-// --- 暴力：枚举所有合法断句，记录最优 cuts 与移动量 ---
-function bruteSolveDetailed(cues: SrtCue[], s: Settings): { cost: number; cuts: number[] | null } {
-  const { text } = flattenCues(cues.map((c) => c.lines))
+// --- 暴力：枚举所有合法断句，记录最优 cuts 与移动量；可选锚点锁定 ---
+function bruteSolveDetailed(
+  cues: SrtCue[],
+  s: Settings,
+  locks?: Array<CueLock | undefined>
+): { cost: number; cuts: number[] | null } {
+  const { text, cuts: origCuts } = flattenCues(cues.map((c) => c.lines))
   const chars = charsOf(text)
   const N = chars.length
   const n = cues.length
   const maxLen = 2 * s.maxChars
   let globalBest = Infinity
   let bestCuts: number[] | null = null
+
+  // 文字归属锁定 ⇒ 对应切点固定在原始位置
+  const fixedCut = new Map<number, number>()
+  locks?.forEach((lk, i) => {
+    if (lk?.text) {
+      fixedCut.set(i, origCuts[i])
+      fixedCut.set(i + 1, origCuts[i + 1])
+    }
+  })
 
   const valid = (q: number, p: number) => {
     if (p - q < 1 || p - q > maxLen) return false
@@ -90,7 +103,7 @@ function bruteSolveDetailed(cues: SrtCue[], s: Settings): { cost: number; cuts: 
     if (i === n - 1) {
       if (!valid(start, N)) return
       const cuts = cutsArr.concat([N])
-      const t = optimizeTimingImpl(cues, cuts, s)
+      const t = optimizeTimingImpl(cues, cuts, s, locks)
       if (t && t.moveMs < globalBest) {
         globalBest = t.moveMs
         bestCuts = cuts
@@ -99,6 +112,8 @@ function bruteSolveDetailed(cues: SrtCue[], s: Settings): { cost: number; cuts: 
     }
     for (let p = start + 1; p <= N - (n - 1 - i); p++) {
       if (p - start > maxLen) break
+      const fx = fixedCut.get(i + 1)
+      if (fx !== undefined && p !== fx) continue
       if (!valid(start, p)) continue
       cutsArr.push(p)
       rec(i + 1, p)
@@ -109,8 +124,8 @@ function bruteSolveDetailed(cues: SrtCue[], s: Settings): { cost: number; cuts: 
   return { cost: globalBest, cuts: bestCuts }
 }
 
-function bruteSolve(cues: SrtCue[], s: Settings): number {
-  return bruteSolveDetailed(cues, s).cost
+function bruteSolve(cues: SrtCue[], s: Settings, locks?: Array<CueLock | undefined>): number {
+  return bruteSolveDetailed(cues, s, locks).cost
 }
 
 function mkCue(s: number, e: number, lines: string[]): SrtCue {
@@ -336,6 +351,269 @@ console.log('== SRT 往返 ==')
   const raw = '1\n00:00:01,500 --> 00:00:02,500\nhello\nworld\n\n2\n00:00:03.000 --> 00:00:04.000\nfoo\n'
   const { cues } = parseSrt(raw)
   assert(cues.length === 2 && cues[0].startMs === 1500 && cues[0].lines[1] === 'world', 'SRT 解析（逗号/点毫秒、多行）')
+}
+
+// ---------------------------------------------------------------------------
+// 锚点锁定
+// ---------------------------------------------------------------------------
+
+console.log('== 时间优化（含锚点锁定）PAVA vs 暴力 ==')
+{
+  const rng = mulberry(20260921)
+  let cases = 0
+  for (let trial = 0; trial < 60; trial++) {
+    const n = 2 + Math.floor(rng() * 3) // 2..4
+    const cps = 8 + Math.floor(rng() * 15)
+    const gap = [0, 40, 80, 120][Math.floor(rng() * 4)]
+    const lens: number[] = []
+    let total = 0
+    for (let i = 0; i < n; i++) {
+      const l = 2 + Math.floor(rng() * 10)
+      lens.push(l)
+      total += l
+    }
+    const minSpan = Math.ceil((1000 * total) / cps) + (n - 1) * gap
+    const span = minSpan + Math.floor(rng() * 2500)
+    const cuts = [0]
+    lens.forEach((l) => cuts.push(cuts[cuts.length - 1] + l))
+    const start0 = 1000 + Math.floor(rng() * 2000)
+    const cues: SrtCue[] = []
+    for (let i = 0; i < n; i++) {
+      const b = i === 0 ? start0 : start0 + Math.floor(rng() * span)
+      const dur = 400 + Math.floor(rng() * 2200)
+      const e = i === n - 1 ? start0 + span : Math.min(start0 + span, b + dur)
+      cues.push(mkCue(Math.min(b, e - 100), Math.max(e, Math.min(b, e - 100) + 200), ['x']))
+    }
+    cues[0] = { ...cues[0], startMs: start0 }
+    cues[n - 1] = { ...cues[n - 1], endMs: start0 + span }
+    // 随机锁定部分开始/结束时间（锁定值 = 原始时间，可能可行也可能不可行）
+    const locks: CueLock[] = cues.map(() => ({ start: rng() < 0.35, end: rng() < 0.35 }))
+    const s: Settings = { cps, maxChars: 40, gapMs: gap }
+    const got = optimizeTimingImpl(cues, cuts, s, locks)
+    const brute = bruteTiming(cues, lens, s, locks)
+    if (!got) {
+      assert(brute === Infinity, `lock-trial ${trial}: PAVA 判不可行但暴力=${brute}`)
+      continue
+    }
+    cases++
+    assert(approx(got.moveMs, brute), `lock-trial ${trial}: moveMs=${got.moveMs} brute=${brute}`)
+    for (let i = 0; i < n; i++) {
+      if (locks[i].start) assert(got.starts[i] === cues[i].startMs, `lock-trial ${trial} cue ${i} 开始锁定被移动`)
+      if (locks[i].end) assert(got.ends[i] === cues[i].endMs, `lock-trial ${trial} cue ${i} 结束锁定被移动`)
+      assert(got.ends[i] - got.starts[i] >= Math.ceil((1000 * lens[i]) / cps) - 1e-6, `lock-trial ${trial} cue ${i} 时长不足`)
+      if (i > 0) assert(got.starts[i] - got.ends[i - 1] >= gap - 1e-6, `lock-trial ${trial} cue ${i} 间隔不足`)
+    }
+  }
+  console.log(`  (${cases} 个可行案例完成)`)
+}
+
+console.log('== 全局 solve（含锚点锁定）vs 全断句枚举 ==')
+{
+  const rng = mulberry(99)
+  for (let trial = 0; trial < 25; trial++) {
+    const n = 2 + Math.floor(rng() * 3)
+    const cps = 6 + Math.floor(rng() * 10)
+    const gap = [0, 60, 120][Math.floor(rng() * 3)]
+    const maxChars = 4 + Math.floor(rng() * 4)
+    const totalChars = n * 2 + Math.floor(rng() * (n * 4))
+    let txt = ''
+    for (let k = 0; k < totalChars; k++) txt += String.fromCharCode(0x4e00 + Math.floor(rng() * 1500))
+    const bounds = [0]
+    while (bounds.length < n) {
+      const p = 1 + Math.floor(rng() * (totalChars - 1))
+      if (!bounds.includes(p)) bounds.push(p)
+    }
+    bounds.sort((a, b) => a - b)
+    bounds.push(totalChars)
+    const minSpan = Math.ceil((1000 * totalChars) / cps) + (n - 1) * gap
+    const span = minSpan + Math.floor(rng() * 1500)
+    const start0 = 5000
+    const cues: SrtCue[] = []
+    for (let i = 0; i < n; i++) {
+      const b = i === 0 ? start0 : start0 + Math.floor(rng() * span)
+      const e =
+        i === n - 1
+          ? start0 + span
+          : Math.min(start0 + span, Math.min(b, start0 + span - 100) + 300 + Math.floor(rng() * 1200))
+      const bb = Math.min(b, e - 100)
+      cues.push(mkCue(bb, Math.max(e, bb + 200), [txt.slice(bounds[i], bounds[i + 1])]))
+    }
+    cues[0] = { ...cues[0], startMs: start0 }
+    cues[n - 1] = { ...cues[n - 1], endMs: start0 + span }
+    const s: Settings = { cps, maxChars, gapMs: gap }
+    // 随机锁定（锁定值 = 原始状态）
+    const locks: CueLock[] = cues.map(() => ({
+      text: rng() < 0.3,
+      start: rng() < 0.3,
+      end: rng() < 0.3,
+    }))
+    const res = solve(cues, s, locks)
+    const brute = bruteSolve(cues, s, locks)
+    if (res.ok) {
+      assert(
+        approx(res.metrics.timeMoveMs, brute),
+        `lock-joint ${trial}: solve=${res.metrics.timeMoveMs} brute=${brute} (n=${n},cps=${cps},mc=${maxChars},gap=${gap})`
+      )
+      // 锁定项严格保持
+      res.cues.forEach((c, i) => {
+        if (locks[i].start) assert(c.startMs === cues[i].startMs, `lock-joint ${trial} cue ${i} 开始锁定被移动`)
+        if (locks[i].end) assert(c.endMs === cues[i].endMs, `lock-joint ${trial} cue ${i} 结束锁定被移动`)
+        if (locks[i].text) {
+          assert(res.newCuts[i] === res.origCuts[i] && res.newCuts[i + 1] === res.origCuts[i + 1], `lock-joint ${trial} cue ${i} 文字切点被移动`)
+        }
+      })
+      // 文字完整保持
+      const joined = res.cues.map((c) => c.text).join('')
+      assert(joined === txt, `lock-joint ${trial}: 文字被改动`)
+    } else {
+      assert(brute === Infinity, `lock-joint ${trial}: solve 判无解但暴力=${brute}`)
+    }
+  }
+}
+
+console.log('== 锚点锁定：可行场景严格保持锁定项 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四五六']),
+    mkCue(1150, 1600, ['七八九十']),
+    mkCue(1700, 3000, ['十一十二十三十四十五']),
+  ]
+  const s: Settings = { cps: 10, maxChars: 20, gapMs: 120 }
+  const locks: CueLock[] = [{ end: true }, { start: true }, { text: true, start: true }]
+  const res = solve(cues, s, locks)
+  assert(res.ok, '带锁定的可行场景应可解')
+  if (res.ok) {
+    assert(res.cues[0].endMs === 1000, '第 1 条结束时间锁定保持')
+    assert(res.cues[1].startMs === 1150, '第 2 条开始时间锁定保持')
+    assert(res.cues[2].startMs === 1700, '第 3 条开始时间锁定保持')
+    assert(res.cues[2].text === '十一十二十三十四十五', '第 3 条文字锁定保持')
+    assert(res.newCuts[2] === res.origCuts[2] && res.newCuts[3] === res.origCuts[3], '文字锁定的切点保持原位')
+    // 仅第 2 条结束需前移 20ms（间隔 100 → 120）
+    assert(res.metrics.timeMoveMs === 20, `时间移动量应为 20ms，实际 ${res.metrics.timeMoveMs}`)
+    res.cues.forEach((c, i) => {
+      const len = charsOf(c.text).length
+      assert(c.endMs - c.startMs >= Math.ceil((1000 * len) / 10) - 1e-6, `cue ${i} CPS 违反`)
+      if (i > 0) assert(c.startMs - res.cues[i - 1].endMs >= 120 - 1e-6, `cue ${i} 间隔违反`)
+    })
+  }
+}
+
+console.log('== 锚点锁定：文字锁定条不变，其余条正常调整 ==')
+{
+  const cues = [
+    mkCue(0, 800, ['一二三四五六七八']),
+    mkCue(900, 1500, ['九十十一十二']),
+    mkCue(1600, 3000, ['十三十四十五十六']),
+  ]
+  const s: Settings = { cps: 8, maxChars: 20, gapMs: 100 }
+  const res = solve(cues, s, [{}, { text: true }, {}])
+  assert(res.ok, '中间条文字锁定应仍可解')
+  if (res.ok) {
+    assert(res.cues[1].text === '九十十一十二', '锁定条文字保持')
+    assert(res.newCuts[1] === res.origCuts[1] && res.newCuts[2] === res.origCuts[2], '锁定条切点保持')
+    assert(
+      res.cues.map((c) => c.text).join('') === '一二三四五六七八九十十一十二十三十四十五十六',
+      '总文字完整保持'
+    )
+  }
+}
+
+console.log('== 锚点冲突：相邻锁定边界间隔不足 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1050, 2000, ['五六七八']),
+  ]
+  const s: Settings = { cps: 10, maxChars: 20, gapMs: 120 }
+  const res = solve(cues, s, [{ end: true }, { start: true }])
+  assert(!res.ok, '锁定间隔 50ms < 120ms 应无解')
+  if (!res.ok) {
+    const c = res.conflicts.find((c) => c.rule.includes('锚点冲突'))
+    assert(!!c, '应报告锚点冲突而非通用失败')
+    if (c) {
+      assert(c.message.includes('第 1 条结束'), '冲突应指出第 1 条结束锚点')
+      assert(c.message.includes('第 2 条开始'), '冲突应指出第 2 条开始锚点')
+      assert(c.message.includes('120'), '应给出最小所需间隔 120ms')
+      assert(c.message.includes('50'), '应给出当前可用间隔 50ms')
+    }
+  }
+}
+
+console.log('== 锚点冲突：锁定起止的时长不足 ==')
+{
+  const cues = [
+    mkCue(0, 500, ['一二三四五六七八九十']), // 10 字 @10cps 需 1000ms
+    mkCue(1500, 3000, ['一二三四']),
+  ]
+  const s: Settings = { cps: 10, maxChars: 20, gapMs: 100 }
+  const res = solve(cues, s, [{ text: true, end: true }, {}])
+  assert(!res.ok, '锁定文字 10 字在 500ms 内放不下应无解')
+  if (!res.ok) {
+    const c = res.conflicts.find((c) => c.rule.includes('锚点冲突'))
+    assert(!!c, '应报告锚点冲突')
+    if (c) {
+      assert(c.message.includes('第 1 条'), '应指出第 1 条的锚点')
+      assert(c.message.includes('1000'), '应给出最小所需时长 1000ms')
+      assert(c.message.includes('500'), '应给出当前可用时长 500ms')
+    }
+  }
+}
+
+console.log('== 锚点冲突：锁定文字超出行数上限 ==')
+{
+  const cues = [
+    mkCue(0, 5000, ['一二三四五六七八九十十一十二']), // 12 字
+    mkCue(5200, 8000, ['三四']),
+  ]
+  const res = solve(cues, { cps: 10, maxChars: 5, gapMs: 100 }, [{ text: true }, {}])
+  assert(!res.ok, '锁定 12 字在 2 行 × 5 字下应无解')
+  if (!res.ok) {
+    assert(
+      res.conflicts.some((c) => c.rule.includes('锚点冲突') && c.message.includes('第 1 条')),
+      '应指出第 1 条文字锁定与单行字数冲突'
+    )
+  }
+}
+
+console.log('== 解除锁定后恢复可解 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1050, 2000, ['五六七八']),
+  ]
+  const s: Settings = { cps: 10, maxChars: 20, gapMs: 120 }
+  const locked = solve(cues, s, [{ end: true }, { start: true }])
+  assert(!locked.ok, '双重锁定（间隔 50ms < 120ms）应无解')
+  // 解除第 2 条开始锁定 ⇒ 恢复可解，且第 1 条结束仍锁定
+  const unlocked = solve(cues, s, [{ end: true }, {}])
+  assert(unlocked.ok, '解除一个锁定后应恢复可解')
+  if (unlocked.ok) {
+    assert(unlocked.cues[0].endMs === 1000, '第 1 条结束锁定仍保持')
+    assert(unlocked.cues[1].startMs >= 1120, '第 2 条开始自动后移满足间隔')
+  }
+  // 全部解除 ⇒ 可解
+  const free = solve(cues, s)
+  assert(free.ok, '全部解除后应可解')
+}
+
+console.log('== 全部锁定且原稿已可行 ⇒ 零移动恒等 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1200, 2200, ['五六七八']),
+    mkCue(2400, 3600, ['九十十一']),
+  ]
+  const s: Settings = { cps: 10, maxChars: 20, gapMs: 120 }
+  const locks: CueLock[] = cues.map(() => ({ text: true, start: true, end: true }))
+  const res = solve(cues, s, locks)
+  assert(res.ok, '原稿可行时全锁定应可解')
+  if (res.ok) {
+    assert(res.metrics.timeMoveMs === 0 && res.metrics.charMove === 0, '全锁定应零移动')
+    res.cues.forEach((c, i) => {
+      assert(c.startMs === cues[i].startMs && c.endMs === cues[i].endMs, `cue ${i} 时间保持`)
+      assert(c.text === cues[i].lines.join(''), `cue ${i} 文字保持`)
+    })
+  }
 }
 
 function mulberry(seed: number) {

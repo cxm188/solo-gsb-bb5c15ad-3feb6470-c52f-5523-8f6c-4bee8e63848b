@@ -4,6 +4,11 @@
 //       联合调整 (a) 文字断句切点 (b) 各条毫秒边界，
 //       使全部约束满足且“边界总移动量”最小。
 //
+// 锚点锁定：可对每条字幕分别锁定【文字归属 / 开始时间 / 结束时间】。
+//   - 锁定文字归属 ⇒ 该条左右两个切点固定在其原始位置（DP/搜索只动自由切点）；
+//   - 锁定开始/结束 ⇒ 该时间边界在 L1 保序回归中以极大权重钉死（与首末边界相同）；
+//   - 求解前对相邻钉死点做区间可行性预检，直接报告冲突锚点与最小所需时长/间隔。
+//
 // 约束（每条字幕）：
 //   - 折行行数 ≤ MAX_LINES（标准字幕两行），每行 ≤ maxChars（词感知折行）
 //   - 时长 ≥ ceil(1000 * 字数 / cps)                     （每秒字符数下限）
@@ -40,6 +45,16 @@ export interface Settings {
   maxChars: number
   /** 相邻字幕最小提示间隔（毫秒） */
   gapMs: number
+}
+
+/** 单条字幕的锚点锁定（与选区内字幕按下标一一对应） */
+export interface CueLock {
+  /** 锁定文字归属：该条文字（及其左右切点）保持原样 */
+  text?: boolean
+  /** 锁定开始时间 */
+  start?: boolean
+  /** 锁定结束时间 */
+  end?: boolean
 }
 
 export interface Conflict {
@@ -177,7 +192,12 @@ interface TimingSolution {
   moveMs: number
 }
 
-function optimizeTimingImpl(cues: SrtCue[], cuts: number[], settings: Settings): TimingSolution | null {
+function optimizeTimingImpl(
+  cues: SrtCue[],
+  cuts: number[],
+  settings: Settings,
+  locks?: Array<CueLock | undefined>
+): TimingSolution | null {
   const n = cues.length
   const { cps, gapMs } = settings
   const lengths: number[] = []
@@ -190,24 +210,34 @@ function optimizeTimingImpl(cues: SrtCue[], cuts: number[], settings: Settings):
   const anchors: Anchor[] = new Array(P)
   const S = new Int32Array(P)
 
+  // 钉死点：首条开始 / 末条结束（恒定）+ 用户锁定的时间锚点
+  const pins = new Map<number, number>()
+  pins.set(0, cues[0].startMs)
+  pins.set(P - 1, cues[n - 1].endMs)
+  if (locks) {
+    for (let i = 0; i < n; i++) {
+      const lk = locks[i]
+      if (!lk) continue
+      if (lk.start) pins.set(2 * i, cues[i].startMs)
+      if (lk.end) pins.set(2 * i + 1, cues[i].endMs)
+    }
+  }
+
   for (let i = 0; i < n; i++) {
     const bp = 2 * i
     const ep = 2 * i + 1
     S[bp] = i === 0 ? 0 : S[bp - 1] - gapMs
     S[ep] = S[bp] - D[i]
-    anchors[bp] = { value: cues[i].startMs + S[bp], weight: i === 0 ? PIN_WEIGHT : 1 }
-    anchors[ep] = {
-      value: cues[i].endMs + S[ep],
-      weight: i === n - 1 ? PIN_WEIGHT : 1,
-    }
+    anchors[bp] = { value: cues[i].startMs + S[bp], weight: pins.has(bp) ? PIN_WEIGHT : 1 }
+    anchors[ep] = { value: cues[i].endMs + S[ep], weight: pins.has(ep) ? PIN_WEIGHT : 1 }
   }
 
   const z = isotonicL1(anchors)
   const t = z.map((zv, p) => zv - S[p])
 
-  // 钉死点必须不动；若被合并说明该断句下总时长不足（理论上预检已排除，取整余量时兜底）
-  if (Math.round(t[0]) !== cues[0].startMs || Math.round(t[P - 1]) !== cues[n - 1].endMs) {
-    return null
+  // 钉死点（含锁定锚点）必须不动；若被合并说明锚点间约束在该断句下不可同时满足
+  for (const [pos, time] of pins) {
+    if (Math.round(t[pos]) !== time) return null
   }
 
   const starts: number[] = []
@@ -239,6 +269,8 @@ interface DPContext {
   diffPref: Int32Array[]
   nonSpacePrefix: Int32Array
   validCache: Map<number, boolean>
+  /** fixedCut[k] ≥ 0 表示第 k 个切点必须落在该码点位置（文字归属锁定） */
+  fixedCut: Int32Array
 }
 
 function segKey(q: number, p: number): number {
@@ -266,9 +298,9 @@ function segmentValid(ctx: DPContext, q: number, p: number): boolean {
 
 const DP_INF = 1 << 30
 
-/** 断句 DP（密集数组实现），词典序最小化 (时长缺口, 文字移动量) */
+/** 断句 DP（密集数组实现），词典序最小化 (时长缺口, 文字移动量)；固定切点强制取原值 */
 function optimizeCuts(ctx: DPContext): number[] | null {
-  const { n, N, settings, durations, diffPref } = ctx
+  const { n, N, settings, durations, diffPref, fixedCut } = ctx
   const maxLen = MAX_LINES * settings.maxChars
   const cps = settings.cps
 
@@ -288,6 +320,7 @@ function optimizeCuts(ctx: DPContext): number[] | null {
     const diff = diffPref[owner]
     const endLimit = i === n ? N : N - (n - i)
     const startLimit = i === 1 ? 0 : N - (n - i + 1)
+    const fixedP = fixedCut[i]
     for (let q = i - 1; q <= startLimit; q++) {
       const gq = gapArr[q]
       if (gq === DP_INF) continue
@@ -295,6 +328,7 @@ function optimizeCuts(ctx: DPContext): number[] | null {
       const hi = Math.min(endLimit, q + maxLen, N)
       for (let p = q + 1; p <= hi; p++) {
         if (i === n && p !== N) continue
+        if (fixedP >= 0 && p !== fixedP) continue
         if (!segmentValid(ctx, q, p)) continue
         const minDur = Math.ceil((1000 * (p - q)) / cps)
         const gapPen = gq + (minDur > dur ? minDur - dur : 0)
@@ -329,7 +363,7 @@ function optimizeCuts(ctx: DPContext): number[] | null {
 // ---------------------------------------------------------------------------
 
 function greedyCuts(ctx: DPContext, targetCum: number[]): number[] | null {
-  const { n, N } = ctx
+  const { n, N, fixedCut } = ctx
   const maxLen = MAX_LINES * ctx.settings.maxChars
   const cuts = [0]
   for (let i = 0; i < n - 1; i++) {
@@ -338,6 +372,13 @@ function greedyCuts(ctx: DPContext, targetCum: number[]): number[] | null {
     const lo = Math.max(start + 1, N - rest * maxLen)
     const hi = Math.min(start + maxLen, N - rest) // 后续每条至少 1 字
     if (lo > hi) return null
+    const fx = fixedCut[i + 1]
+    if (fx >= 0) {
+      // 固定切点：必须取原值
+      if (fx < lo || fx > hi || !segmentValid(ctx, start, fx)) return null
+      cuts.push(fx)
+      continue
+    }
     const target = Math.round(targetCum[i] * N)
     let chosen = -1
     for (let d = 0; d <= maxLen + 1 && chosen === -1; d++) {
@@ -358,7 +399,7 @@ function greedyCuts(ctx: DPContext, targetCum: number[]): number[] | null {
 
 /** 在合法区间内随机逐条生成切点（局部合法，再由时间优化判全局可行） */
 function randomCuts(ctx: DPContext, rng: () => number): number[] | null {
-  const { n, N } = ctx
+  const { n, N, fixedCut } = ctx
   const maxLen = MAX_LINES * ctx.settings.maxChars
   const cuts = [0]
   for (let i = 0; i < n - 1; i++) {
@@ -367,6 +408,12 @@ function randomCuts(ctx: DPContext, rng: () => number): number[] | null {
     const lo = Math.max(start + 1, N - rest * maxLen)
     const hi = Math.min(start + maxLen, N - rest)
     if (lo > hi) return null
+    const fx = fixedCut[i + 1]
+    if (fx >= 0) {
+      if (fx < lo || fx > hi || !segmentValid(ctx, start, fx)) return null
+      cuts.push(fx)
+      continue
+    }
     const feasible: number[] = []
     for (let c = lo; c <= hi; c++) if (segmentValid(ctx, start, c)) feasible.push(c)
     if (feasible.length === 0) return null
@@ -421,10 +468,16 @@ function charMoveOf(
 // 主入口
 // ---------------------------------------------------------------------------
 
-export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
+export function solve(
+  cuesInput: SrtCue[],
+  settings: Settings,
+  locks?: Array<CueLock | undefined>
+): SolveResult {
   const conflicts: Conflict[] = []
   const cues = cuesInput.map((c, i) => ({ ...c, index: i }))
   const n = cues.length
+  const lockAt = (i: number): CueLock => locks?.[i] ?? {}
+  const hasLocks = !!locks && locks.some((l) => l && (l.text || l.start || l.end))
 
   if (n === 0) return { ok: false, conflicts: [{ rule: '选区为空', message: '请至少选择 1 条字幕。' }] }
   if (!Number.isFinite(settings.cps) || settings.cps <= 0)
@@ -456,7 +509,59 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
     }
   }
 
-  // 2. 冲突预检
+  // 文字归属锁定 ⇒ 对应切点固定在原始位置
+  const fixedCut = new Int32Array(n + 1).fill(-1)
+  fixedCut[0] = 0
+  fixedCut[n] = N
+  for (let i = 0; i < n; i++) {
+    if (lockAt(i).text) {
+      fixedCut[i] = origCuts[i]
+      fixedCut[i + 1] = origCuts[i + 1]
+    }
+  }
+
+  // 2a. 锚点预检（文字锁定）：锁定段折行合法性 + 锁定切点间区段容量
+  if (hasLocks) {
+    const anchorConflicts: Conflict[] = []
+    for (let i = 0; i < n; i++) {
+      if (!lockAt(i).text) continue
+      const seg = chars.slice(origCuts[i], origCuts[i + 1]).join('').trim()
+      const segLen = charsOf(seg).length
+      if (segLen === 0) {
+        anchorConflicts.push({
+          rule: '锚点冲突：文字锁定',
+          message: `第 ${i + 1} 条文字已锁定，但内容为空，无法满足“每条至少 1 个非空字符”。请解除第 ${i + 1} 条的文字锁定。`,
+        })
+        continue
+      }
+      const lineCount = wrapText(seg, settings.maxChars).length
+      if (lineCount > MAX_LINES) {
+        anchorConflicts.push({
+          rule: '锚点冲突：单行字数',
+          message: `第 ${i + 1} 条文字已锁定（${segLen} 字），按单行 ${settings.maxChars} 字折行需要 ${lineCount} 行，超过 ${MAX_LINES} 行上限（单行字数至少需 ${Math.ceil(segLen / MAX_LINES)} 且词边界可折行）。请调大单行字数，或解除第 ${i + 1} 条的文字锁定。`,
+        })
+      }
+    }
+    // 被固定切点夹住的区段：文字量已确定，容量必须装得下
+    let u = 0
+    while (u < n) {
+      let v = u
+      while (v < n - 1 && fixedCut[v + 1] < 0) v++
+      const L = fixedCut[v + 1] - fixedCut[u]
+      const cap = (v - u + 1) * MAX_LINES * settings.maxChars
+      const singleLocked = u === v && !!lockAt(u).text
+      if (L > cap && !singleLocked && !(u === 0 && v === n - 1)) {
+        anchorConflicts.push({
+          rule: '锚点冲突：单行字数',
+          message: `第 ${u + 1}–${v + 1} 条之间的文字被文字锚点固定为 ${L} 字，但这 ${v - u + 1} 条最多容纳 ${cap} 字（每条 ${MAX_LINES} 行 × ${settings.maxChars} 字）。请调大单行字数，或解除部分文字锁定。`,
+        })
+      }
+      u = v + 1
+    }
+    if (anchorConflicts.length) return { ok: false, conflicts: anchorConflicts }
+  }
+
+  // 2b. 冲突预检
   const fixedStart = cues[0].startMs
   const fixedEnd = cues[n - 1].endMs
   const span = fixedEnd - fixedStart
@@ -494,6 +599,81 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
   }
   if (conflicts.length) return { ok: false, conflicts }
 
+  // 2c. 锚点预检（时间锁定）：相邻钉死点之间的区间可行性。
+  //     钉死点 = 选区首条开始 / 末条结束（恒定）+ 用户锁定的开始/结束时间。
+  //     对每对相邻钉死点：可用时间 ≥ 区间最小时长 + 区间间隔需求，
+  //     其中被固定切点夹住的区段文字量确定（取下界 ceil(1000·L/cps)），
+  //     其余每条至少 1 字。不满足 ⇒ 无论断句如何调整都无解，直接报告冲突锚点。
+  if (hasLocks) {
+    interface Pin {
+      pos: number // 节点链位置：b_i=2i，e_i=2i+1
+      time: number
+      label: string
+    }
+    const pins: Pin[] = [
+      {
+        pos: 0,
+        time: cues[0].startMs,
+        label: lockAt(0).start ? '第 1 条开始时间（锁定）' : '第 1 条开始时间（选区起点，固定）',
+      },
+      {
+        pos: 2 * n - 1,
+        time: cues[n - 1].endMs,
+        label: lockAt(n - 1).end
+          ? `第 ${n} 条结束时间（锁定）`
+          : `第 ${n} 条结束时间（选区终点，固定）`,
+      },
+    ]
+    for (let i = 0; i < n; i++) {
+      const lk = lockAt(i)
+      if (lk.start && i !== 0)
+        pins.push({ pos: 2 * i, time: cues[i].startMs, label: `第 ${i + 1} 条开始时间（锁定）` })
+      if (lk.end && i !== n - 1)
+        pins.push({ pos: 2 * i + 1, time: cues[i].endMs, label: `第 ${i + 1} 条结束时间（锁定）` })
+    }
+    pins.sort((a, b) => a.pos - b.pos)
+
+    const min1 = Math.ceil(1000 / settings.cps)
+    const anchorConflicts: Conflict[] = []
+    for (let k = 0; k + 1 < pins.length; k++) {
+      const A = pins[k]
+      const B = pins[k + 1]
+      const available = B.time - A.time
+      // 完整落在两钉死点之间的字幕序号区间 [cueLo..cueHi]
+      const cueLo = Math.ceil(A.pos / 2)
+      const cueHi = Math.floor((B.pos - 1) / 2)
+      let gapCount = 0
+      for (let g = 0; g < n - 1; g++) {
+        if (2 * g + 1 >= A.pos && 2 * g + 2 <= B.pos) gapCount++
+      }
+      // 时长下界：按固定切点划分区段，文字量确定的区段取 ceil(1000·L/cps)
+      let durMin = 0
+      let u = cueLo
+      while (u <= cueHi) {
+        let v = u
+        while (v + 1 <= cueHi && fixedCut[v + 1] < 0) v++
+        if (fixedCut[u] >= 0 && fixedCut[v + 1] >= 0) {
+          durMin += Math.ceil((1000 * (fixedCut[v + 1] - fixedCut[u])) / settings.cps)
+        } else {
+          durMin += (v - u + 1) * min1
+        }
+        u = v + 1
+      }
+      const gapNeed = gapCount * settings.gapMs
+      const required = durMin + gapNeed
+      if (available < required) {
+        const parts: string[] = []
+        if (durMin > 0) parts.push(`时长至少 ${durMin} ms`)
+        if (gapCount > 0) parts.push(`${gapCount} 个间隔 × ${settings.gapMs} ms = ${gapNeed} ms`)
+        anchorConflicts.push({
+          rule: gapCount > 0 && durMin === 0 ? '锚点冲突：最小间隔' : '锚点冲突：最小时长',
+          message: `${A.label}与${B.label}之间可用 ${available} ms，但按当前参数最小需要 ${required} ms（${parts.join(' + ')}），还差 ${required - available} ms。请解除相关锚点锁定、调整锁定时间，或放宽每秒字符数/最小间隔。`,
+        })
+      }
+    }
+    if (anchorConflicts.length) return { ok: false, conflicts: anchorConflicts }
+  }
+
   // 3. DP 上下文（与时长无关的部分）
   const nonSpacePrefix = new Int32Array(N + 1)
   for (let j = 0; j < N; j++)
@@ -517,6 +697,7 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
     diffPref,
     nonSpacePrefix,
     validCache: new Map<number, boolean>(),
+    fixedCut,
   }
 
   // 预热：一次性计算所有可能段 [q,p) 的折行合法性（供 DP / 随机切点 / 邻域共用）
@@ -534,7 +715,7 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
   const timingOf = (cutsArg: number[]): TimingSolution | null => {
     const key = cutsArg.join(',')
     if (timingCache.has(key)) return timingCache.get(key)!
-    const t = optimizeTimingImpl(cues, cutsArg, settings)
+    const t = optimizeTimingImpl(cues, cutsArg, settings, locks)
     timingCache.set(key, t)
     return t
   }
@@ -633,8 +814,12 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
 
   // 模拟退火局部搜索：邻域 = 单切点平移 / 相邻双切点同移（块平移）/ 双切点独立扰动。
   // 每轮对新构型先交替到不动点再评估；允许短暂上坡以跨越宽谷。
+  // 固定切点（文字锁定）不参与扰动。
+  const freeCuts: number[] = []
+  for (let k = 1; k < n; k++) if (fixedCut[k] < 0) freeCuts.push(k)
+  const freePairs = freeCuts.filter((k) => k + 1 <= n - 1 && fixedCut[k + 1] < 0)
   const startBest = bestBox.v
-  if (startBest) {
+  if (startBest && freeCuts.length > 0) {
     const rng = mulberry32(987654321)
     const stepMax = MAX_LINES * settings.maxChars
     const vctx: DPContext = { ...baseCtx, durations: [] }
@@ -680,20 +865,20 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
         const mag = 1 + Math.floor(rng() * Math.min(stepMax, 1 + ((step % 4) + 1) * 3))
         return (rng() < 0.5 ? -1 : 1) * mag
       }
-      if (moveKind < 0.55 || n < 3) {
+      if (moveKind < 0.55 || freePairs.length === 0) {
         // 单切点平移
-        const i = 1 + Math.floor(rng() * (n - 1))
+        const i = freeCuts[Math.floor(rng() * freeCuts.length)]
         cand[i] += pickDelta()
       } else if (moveKind < 0.8) {
-        // 相邻双切点同向同幅（中间条块平移）
-        const i = 1 + Math.floor(rng() * (n - 2))
+        // 相邻双切点同向同幅（中间条块平移，两个切点均须自由）
+        const i = freePairs[Math.floor(rng() * freePairs.length)]
         const d = pickDelta()
         cand[i] += d
         cand[i + 1] += d
       } else {
-        // 两个随机切点独立扰动
-        const i = 1 + Math.floor(rng() * (n - 1))
-        const j = 1 + Math.floor(rng() * (n - 1))
+        // 两个随机自由切点独立扰动
+        const i = freeCuts[Math.floor(rng() * freeCuts.length)]
+        const j = freeCuts[Math.floor(rng() * freeCuts.length)]
         cand[i] += pickDelta()
         if (j !== i) cand[j] += pickDelta()
       }
@@ -733,6 +918,7 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
         }
       }
       for (let i = 1; i < n; i++) {
+        if (fixedCut[i] >= 0) continue // 固定切点不动
         for (let d = -R; d <= R; d++) {
           if (d === 0) continue
           const cand = cur.slice()
@@ -741,6 +927,7 @@ export function solve(cuesInput: SrtCue[], settings: Settings): SolveResult {
         }
       }
       if (n <= 20) for (let i = 1; i < n - 1; i++) {
+        if (fixedCut[i] >= 0 || fixedCut[i + 1] >= 0) continue
         for (let d1 = -R; d1 <= R; d1++) {
           for (let d2 = -R; d2 <= R; d2++) {
             if (d1 === 0 && d2 === 0) continue

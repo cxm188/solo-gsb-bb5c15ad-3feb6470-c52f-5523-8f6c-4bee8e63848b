@@ -152,7 +152,7 @@ input[type='number'] {
 
 .cue-row {
   display: grid;
-  grid-template-columns: 44px 140px 1fr;
+  grid-template-columns: 44px 140px 1fr auto;
   gap: 10px;
   padding: 7px 12px;
   border-bottom: 1px solid var(--border);
@@ -176,6 +176,64 @@ input[type='number'] {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
   font-size: 12px;
+}
+
+/* 锚点锁定 */
+.lock-cell {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+  align-items: center;
+  min-width: 76px;
+}
+
+.lock-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 5px;
+  padding: 1px 7px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.lock-btn:hover {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: transparent;
+}
+
+.lock-btn.on {
+  background: rgba(240, 169, 59, 0.18);
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.lock-tags {
+  display: inline-flex;
+  gap: 4px;
+  opacity: 0.75;
+}
+
+.lock-tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: rgba(240, 169, 59, 0.16);
+  color: var(--warn);
+  margin-left: 4px;
+}
+
+.lock-tags .lock-tag {
+  margin-left: 0;
+}
+
+.delta.locked {
+  background: rgba(240, 169, 59, 0.16);
+  color: var(--warn);
 }
 
 /* 并排结果 */
@@ -356,6 +414,10 @@ input[type='number'] {
   background: rgba(123, 211, 255, 0.4);
 }
 
+.sw-lock {
+  background: rgba(240, 169, 59, 0.4);
+}
+
 .cps-tag {
   font-size: 11px;
   color: var(--muted);
@@ -370,9 +432,14 @@ input[type='number'] {
     border-top: 1px solid var(--border);
   }
   .cue-row {
-    grid-template-columns: 36px 1fr;
+    grid-template-columns: 36px 1fr auto;
   }
   .cue-row .t {
     grid-column: 2;
+  }
+  .cue-row .lock-cell {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+    align-self: center;
   }
 }
