@@ -1,0 +1,8 @@
+# 一键启动（生产构建 + nginx 托管）
+# 访问地址：http://localhost:8080
+services:
+  web:
+    build: .
+    ports:
+      - "${PORT:-8080}:8080"
+    restart: unless-stopped
