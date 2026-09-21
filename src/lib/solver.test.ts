@@ -3,8 +3,8 @@
 //  - solve 与“枚举全部断句 × 每案最优时间”的全局最优对照
 //  - 约束满足性、文字保持、起止钉死
 //  - 无解冲突场景
-import { parseSrt, SrtCue } from './srt'
-import { solve, Settings, optimizeTimingImpl } from './solver'
+import { parseSrt, SrtCue, msToSrtTime } from './srt'
+import { solve, Settings, optimizeTimingImpl, emptyLocks, AnchorLocks } from './solver'
 import { charsOf, flattenCues, wrapText, isCJK } from './text'
 
 let pass = 0
@@ -18,6 +18,78 @@ function assert(cond: boolean, msg: string) {
 }
 function approx(a: number, b: number, eps = 0.01) {
   return Math.abs(a - b) <= eps
+}
+
+console.log('== 随机属性：随机锁定下锁定项恒不变且约束满足 ==')
+{
+  const rng = mulberry(31415)
+  let feasibleRuns = 0
+  for (let trial = 0; trial < 30; trial++) {
+    const n = 2 + Math.floor(rng() * 4) // 2..5
+    const cps = 8 + Math.floor(rng() * 10)
+    const gap = [0, 60, 120][Math.floor(rng() * 3)]
+    const maxChars = 5 + Math.floor(rng() * 6)
+    const totalChars = n * 2 + Math.floor(rng() * (n * 3))
+    let txt = ''
+    for (let k = 0; k < totalChars; k++) txt += String.fromCharCode(0x4e00 + Math.floor(rng() * 1500))
+    const bounds = [0]
+    while (bounds.length < n) {
+      const p = 1 + Math.floor(rng() * (totalChars - 1))
+      if (!bounds.includes(p)) bounds.push(p)
+    }
+    bounds.sort((a, b) => a - b)
+    bounds.push(totalChars)
+    const minSpan = Math.ceil((1000 * totalChars) / cps) + (n - 1) * gap
+    const span = minSpan + Math.floor(rng() * 2500)
+    const start0 = 2000
+    const cues: SrtCue[] = []
+    for (let i = 0; i < n; i++) {
+      const b = i === 0 ? start0 : start0 + Math.floor((span * i) / n)
+      const e = i === n - 1 ? start0 + span : Math.min(start0 + span, b + 300 + Math.floor(rng() * 1500))
+      cues.push(mkCue(b, Math.max(e, b + 100), [txt.slice(bounds[i], bounds[i + 1])]))
+    }
+    cues[0] = { ...cues[0], startMs: start0 }
+    cues[n - 1] = { ...cues[n - 1], endMs: start0 + span }
+    const s: Settings = { cps, maxChars, gapMs: gap }
+
+    // 随机锁定（避开隐式端点重复锁，无冲突概率高）
+    const locks = emptyLocks(n)
+    for (let i = 0; i < n; i++) {
+      if (rng() < 0.35) locks.text[i] = true
+      if (i !== 0 && rng() < 0.3) locks.start[i] = true
+      if (i !== n - 1 && rng() < 0.3) locks.end[i] = true
+    }
+    const res = solve(cues, s, locks)
+    if (!res.ok) continue // 随机锚点可能确实冲突，跳过
+    feasibleRuns++
+    // 锁定不变量
+    for (let i = 0; i < n; i++) {
+      if (locks.text[i]) {
+        assert(res.newCuts[i] === res.origCuts[i] && res.newCuts[i + 1] === res.origCuts[i + 1],
+          `trial ${trial}: cue ${i} 文字锁定切点移动`)
+        assert(res.cues[i].lines.join('\n') === cues[i].lines.join('\n'),
+          `trial ${trial}: cue ${i} 文字锁定内容改变`)
+      }
+      if (locks.start[i]) assert(res.cues[i].startMs === cues[i].startMs, `trial ${trial}: cue ${i} 开始锁定移动`)
+      if (locks.end[i]) assert(res.cues[i].endMs === cues[i].endMs, `trial ${trial}: cue ${i} 结束锁定移动`)
+    }
+    assert(res.cues[0].startMs === cues[0].startMs && res.cues[n - 1].endMs === cues[n - 1].endMs,
+      `trial ${trial}: 端点未钉死`)
+    // 文字完全保持
+    assert(res.cues.map((c) => c.text).join('') === txt, `trial ${trial}: 文字被改动`)
+    // 约束
+    res.cues.forEach((c, i) => {
+      const len = charsOf(c.text).length
+      assert(c.endMs - c.startMs + 1e-6 >= Math.ceil((1000 * len) / cps), `trial ${trial} cue ${i} CPS 违反`)
+      if (!locks.text[i]) {
+        c.lines.forEach((l) => assert(charsOf(l).length <= maxChars, `trial ${trial} cue ${i} 行超长`))
+        assert(c.lines.length <= 2, `trial ${trial} cue ${i} 超两行`)
+      }
+      if (i > 0) assert(c.startMs - res.cues[i - 1].endMs + 1e-6 >= gap, `trial ${trial} cue ${i} 间隔违反`)
+    })
+  }
+  console.log(`  (${feasibleRuns} 个随机锁定可行案例完成)`)
+  assert(feasibleRuns >= 10, '随机锁定可行案例过少，测试可能失效')
 }
 
 // --- 暴力：给定 cuts，整数时间上的逐点 DP（前缀最小值），求最小移动量 ---
@@ -268,6 +340,198 @@ console.log('== 已有可行原稿应 0 移动 ==')
   ]
   const res = solve(cues, { cps: 10, maxChars: 20, gapMs: 120 })
   assert(res.ok && res.metrics.timeMoveMs === 0, '原稿已满足约束时时间移动应为 0')
+}
+
+console.log('== 锚点锁定：可行解严格保持锁定项 ==')
+{
+  const cues = [
+    mkCue(0, 600, ['甲乙丙']),
+    mkCue(700, 1200, ['丁戊']),
+    mkCue(1300, 4000, ['己庚辛壬癸子丑寅']),
+  ]
+  const locks = emptyLocks(3)
+  locks.text[1] = true
+  locks.start[1] = true
+  locks.end[1] = true
+  const res = solve(cues, { cps: 10, maxChars: 20, gapMs: 120 }, locks)
+  assert(res.ok, '锁定第2条全部三项时应可解')
+  if (res.ok) {
+    // 文字归属：切点与原稿一致，锁定条字符 owner 全部 = 1
+    assert(res.newCuts[1] === res.origCuts[1] && res.newCuts[2] === res.origCuts[2], '文字锁定切点未保持')
+    for (let j = res.origCuts[1]; j < res.origCuts[2]; j++) {
+      assert(res.newOwner[j] === 1, `锁定条字符 ${j} 归属被改动`)
+    }
+    // 时间锚点
+    assert(res.cues[1].startMs === 700, '锁定的开始时间被移动')
+    assert(res.cues[1].endMs === 1200, '锁定的结束时间被移动')
+    assert(res.cues[0].startMs === 0 && res.cues[2].endMs === 4000, '片段端点未钉死')
+    // 原始行逐字保留
+    assert(
+      JSON.stringify(res.cues[1].lines) === JSON.stringify(['丁戊']) && !!res.cues[1].lockedText,
+      '文字锁定条原始行未保留'
+    )
+    // 其余条仍满足全部约束
+    res.cues.forEach((c, i) => {
+      const len = charsOf(c.text).length
+      assert(c.endMs - c.startMs >= Math.ceil((1000 * len) / 10) - 1e-6, `锁定场景 cue ${i} CPS 违反`)
+      if (i > 0) assert(c.startMs - res.cues[i - 1].endMs + 1e-6 >= 120, `锁定场景 cue ${i} 间隔违反`)
+    })
+  }
+}
+
+console.log('== 锚点锁定：全部文字锁定时只调时间 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1060, 2000, ['五六七八']),
+    mkCue(2100, 3000, ['九甲乙丙']),
+  ]
+  const locks = emptyLocks(3)
+  locks.text.forEach((_, i) => (locks.text[i] = true))
+  const res = solve(cues, { cps: 10, maxChars: 20, gapMs: 120 }, locks)
+  assert(res.ok, '全文字锁定应可解（仅调时间）')
+  if (res.ok) {
+    assert(res.metrics.charMove === 0, '全文字锁定时文字移动量应为 0')
+    const joined = res.cues.map((c) => c.lines.join('')).join('')
+    assert(joined === '一二三四五六七八九甲乙丙', '全文字锁定文字被改动')
+    res.cues.forEach((c, i) => {
+      assert(c.lines.length === 1, `锁定条 ${i} 行数被改动`)
+      if (i > 0) assert(c.startMs - res.cues[i - 1].endMs + 1e-6 >= 120, `全锁定 cue ${i} 间隔违反`)
+    })
+  }
+}
+
+console.log('== 锚点锁定：文字锁定多行原样保留 ==')
+{
+  const cues = [mkCue(0, 2000, ['hello', 'world']), mkCue(2200, 4000, ['foo bar baz'])]
+  const locks = emptyLocks(2)
+  locks.text[0] = true
+  const res = solve(cues, { cps: 10, maxChars: 20, gapMs: 120 }, locks)
+  assert(res.ok, '多行文字锁定应可解')
+  if (res.ok) {
+    assert(
+      JSON.stringify(res.cues[0].lines) === JSON.stringify(['hello', 'world']),
+      '多行锁定条未逐行原样保留'
+    )
+    assert(res.cues[0].text === 'hello world', '锁定条扁平文字应为 hello world')
+  }
+}
+
+console.log('== 锚点冲突：相邻时间锚点间隔不足 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1100, 2000, ['五六七八']),
+    mkCue(2100, 3000, ['九甲乙丙']),
+  ]
+  const locks = emptyLocks(3)
+  locks.end[0] = true
+  locks.start[1] = true
+  const res = solve(cues, { cps: 10, maxChars: 20, gapMs: 500 }, locks)
+  assert(!res.ok && res.conflicts.every((c) => c.rule === '锚点冲突'), '间隔不足应报锚点冲突')
+  if (!res.ok) {
+    const msg = res.conflicts[0].message
+    assert(msg.includes(msToSrtTime(1000)) && msg.includes(msToSrtTime(1100)), '冲突应指出两个锚点时间')
+    assert(msg.includes('500') && msg.includes('400'), '冲突应给出最小间隔与差额')
+  }
+}
+
+console.log('== 锚点冲突：时间锚点间展示时长不足 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1100, 1180, ['五六七八']),
+    mkCue(2100, 3000, ['九甲乙丙']),
+  ]
+  const locks = emptyLocks(3)
+  locks.text[1] = true
+  locks.end[1] = true
+  const res = solve(cues, { cps: 2, maxChars: 20, gapMs: 0 }, locks)
+  assert(!res.ok && res.conflicts.some((c) => c.rule === '锚点冲突'), '时长不足应报锚点冲突')
+  if (!res.ok) {
+    const joined = res.conflicts.map((c) => c.message).join('|')
+    assert(joined.includes('ms') && /还差 \d+ ms/.test(joined), '冲突应给出最小所需时长与差额')
+    assert(joined.includes(msToSrtTime(0)) && joined.includes(msToSrtTime(1180)), '冲突应指出锚点对')
+  }
+}
+
+console.log('== 锚点冲突：文字锚点夹住的区间容量不足 ==')
+{
+  const cues = [
+    mkCue(0, 3000, ['甲']),
+    mkCue(3100, 5000, ['乙丙丁戊己庚辛壬']),
+    mkCue(5100, 7000, ['癸']),
+  ]
+  const locks = emptyLocks(3)
+  locks.text[0] = true
+  locks.text[2] = true
+  const res = solve(cues, { cps: 5, maxChars: 3, gapMs: 0 }, locks)
+  assert(!res.ok && res.conflicts.some((c) => c.rule === '锚点冲突'), '容量不足应报锚点冲突')
+  if (!res.ok) {
+    const msg = res.conflicts.map((c) => c.message).join('|')
+    assert(msg.includes('8 字') && msg.includes('6 字') && msg.includes('多出 2 字'), '应给出容量与超额字数')
+  }
+  // 解除文字锁定后同样参数恢复可解
+  const res2 = solve(cues, { cps: 5, maxChars: 3, gapMs: 0 })
+  assert(res2.ok, '解除冲突锚点后应恢复可解')
+}
+
+console.log('== 解除时间锚点后恢复可解 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1060, 2000, ['五六七八']),
+    mkCue(2100, 3000, ['九甲乙丙']),
+  ]
+  const settings: Settings = { cps: 10, maxChars: 20, gapMs: 120 }
+  const locks = emptyLocks(3)
+  locks.end[0] = true
+  locks.start[1] = true
+  const locked = solve(cues, settings, locks)
+  assert(!locked.ok, '锚点间隔 60ms < 120ms 应无解')
+  const unlocked = solve(cues, settings)
+  assert(unlocked.ok, '解除时间锚点后应恢复可解')
+  if (unlocked.ok) {
+    unlocked.cues.forEach((c, i) => {
+      if (i > 0) assert(c.startMs - unlocked.cues[i - 1].endMs + 1e-6 >= 120, '恢复后仍应满足间隔')
+    })
+  }
+}
+
+console.log('== 锚点锁定：强制其余边界移动且端点不动 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1100, 2000, ['五六七八']),
+    mkCue(2100, 4000, ['九甲乙丙']),
+  ]
+  const settings: Settings = { cps: 10, maxChars: 20, gapMs: 120 }
+  const free = solve(cues, settings)
+  const locks = emptyLocks(3)
+  locks.start[1] = true
+  const locked = solve(cues, settings, locks)
+  assert(free.ok && locked.ok, '对照与锁定方案均应可解')
+  if (free.ok && locked.ok) {
+    assert(locked.cues[1].startMs === 1100 && locked.cues[1].dStart === 0, '锁定的开始边界必须不动')
+    assert(locked.cues[0].startMs === 0 && locked.cues[2].endMs === 4000, '首末边界必须不动')
+    locked.cues.forEach((c, i) => {
+      if (i > 0) assert(c.startMs - locked.cues[i - 1].endMs + 1e-6 >= 120, `强制移动后 cue ${i} 间隔违反`)
+      const len = charsOf(c.text).length
+      assert(c.endMs - c.startMs >= Math.ceil((1000 * len) / 10) - 1e-6, `强制移动后 cue ${i} 时长违反`)
+    })
+  }
+}
+
+console.log('== 锚点锁定：缺省 locks 与无锁定行为一致 ==')
+{
+  const cues = [
+    mkCue(0, 1000, ['一二三四']),
+    mkCue(1200, 2200, ['五六七八']),
+  ]
+  const partial: AnchorLocks = { text: [], start: [], end: [] }
+  const res = solve(cues, { cps: 10, maxChars: 20, gapMs: 120 }, partial)
+  assert(res.ok && res.metrics.timeMoveMs === 0, '空 locks 参数应等价于无锁定')
+  if (res.ok) assert(res.locks.text.length === 2 && res.locks.start[0] && res.locks.end[1], '返回 locks 应含隐式端点')
 }
 
 console.log('== wrapText / 中英展平 ==')
